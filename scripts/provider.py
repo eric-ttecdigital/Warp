@@ -65,6 +65,31 @@ def github_slug(remote: str) -> Optional[str]:
     return "%s/%s" % (match.group(1), match.group(2))
 
 
+def bitbucket_slug(remote: str) -> Optional[str]:
+    """workspace/repo from a bitbucket.org remote URL, or None.
+
+    Mirrors github_slug: accepts http(s), ssh, and token-embedded forms.
+    """
+    if not remote:
+        return None
+    match = re.search(r"bitbucket\.org[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$", remote.strip())
+    if not match:
+        return None
+    return "%s/%s" % (match.group(1), match.group(2))
+
+
+def bitbucket_pr_parts(pr: str) -> Optional[tuple]:
+    """(workspace, repo, id) from a bitbucket.org pull-request URL, or None.
+
+    Accepts both the browser URL (`.../pull-requests/13`) and the REST URL
+    (`.../pullrequests/13`), with or without a trailing slash.
+    """
+    match = re.search(r"bitbucket\.org/([^/]+)/([^/]+)/pull-?requests?/(\d+)", str(pr or ""))
+    if not match:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
 def remote_host(remote: str) -> Optional[str]:
     if not remote:
         return None
@@ -561,14 +586,20 @@ def detect_merge_queue(root: Path, cfg: Optional[dict] = None) -> Optional[bool]
 
 
 def fetch_check_rows(root: Path, pr: str, provider_name: Optional[str] = None) -> Optional[list]:
-    """statusCheckRollup rows, or None when the provider cannot be asked.
+    """statusCheckRollup rows (GitHub) or commit-status rows (Bitbucket), or
+    None when the provider cannot be asked.
 
-    Each row keeps name, conclusion, and log. A dead Agent's pull request still
-    reports make ci and Bugbot from here when the ticket directory has no check line.
+    Each row keeps name, conclusion, status, and log. A dead Agent's pull
+    request still reports make ci and Bugbot from here when the ticket
+    directory has no check line.
     """
-    if provider_name == "bitbucket" or not pr or not shutil.which("gh"):
+    if not pr:
         return None
     text = str(pr)
+    if "bitbucket.org" in text or provider_name == "bitbucket":
+        return _fetch_check_rows_bitbucket(root, text)
+    if not shutil.which("gh"):
+        return None
     if "github.com" not in text and not text.isdigit():
         return None
     viewed = _run(["gh", "pr", "view", text, "--json", "statusCheckRollup"], root)
@@ -768,15 +799,214 @@ def review_signals(root: Path, runner=None) -> Optional[dict]:
     return out
 
 
+def _bitbucket_token(root: Path) -> Optional[str]:
+    """Repository access token for Bitbucket, from the environment or the git
+    origin URL.
+
+    Order:
+      1. $BITBUCKET_TOKEN  (standard Bitbucket envvar name)
+      2. $WARP_BITBUCKET_TOKEN  (project-override, same convention as other WARP_*)
+      3. The token embedded in the origin remote URL as
+         `https://x-token-auth:<token>@bitbucket.org/...`, which is how
+         Cursor Cloud Agents and most CI runners already carry it.
+
+    Returns None when none is configured. Warp never prompts; this returning
+    None means "cannot be asked", which the caller treats as pending.
+    """
+    env = os.environ.get("BITBUCKET_TOKEN") or os.environ.get("WARP_BITBUCKET_TOKEN")
+    if env:
+        return env.strip() or None
+    done = _run(["git", "remote", "get-url", "origin"], root)
+    if done.returncode != 0:
+        return None
+    match = re.match(r"^https?://x-token-auth:([^@]+)@bitbucket\.org/", done.stdout.strip())
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _bitbucket_api_get(root: Path, path: str, token: str) -> Optional[dict]:
+    """GET https://api.bitbucket.org/2.0/<path> and parse JSON.
+
+    Uses curl via _run so the subprocess shape matches gh elsewhere. Returns
+    None on any transport, auth, or parse failure — a None result travels
+    through fetch_pr_state as "unreachable, stay pending" just like a `gh`
+    non-zero exit.
+    """
+    url = "https://api.bitbucket.org/2.0/%s" % path.lstrip("/")
+    done = _run(
+        [
+            "curl",
+            "-sS",
+            "-f",
+            "-H",
+            "Authorization: Bearer %s" % token,
+            "-H",
+            "Accept: application/json",
+            url,
+        ],
+        root,
+    )
+    if done.returncode != 0:
+        return None
+    try:
+        doc = json.loads(done.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+# Bitbucket Cloud reports a pull request in one of OPEN / MERGED / DECLINED /
+# SUPERSEDED. The snap shape only knows OPEN / MERGED / CLOSED (what GitHub
+# reports), so DECLINED and SUPERSEDED collapse to CLOSED. Only MERGED, read
+# from the provider, marks a ticket merged.
+_BITBUCKET_STATE_MAP = {
+    "OPEN": "OPEN",
+    "MERGED": "MERGED",
+    "DECLINED": "CLOSED",
+    "SUPERSEDED": "CLOSED",
+}
+
+
+def _fetch_pr_state_bitbucket(root: Path, pr: str) -> Optional[dict]:
+    """Live Bitbucket Cloud pull request state, or None when it cannot be asked.
+
+    Returns a snap with the same keys as the GitHub body of fetch_pr_state so
+    pipeline.py and heal.py stay provider-agnostic. Auth is read from
+    _bitbucket_token.
+    """
+    parts = bitbucket_pr_parts(pr)
+    if not parts:
+        return None
+    token = _bitbucket_token(root)
+    if not token:
+        return None
+    ws, repo, pr_id = parts
+    doc = _bitbucket_api_get(root, "repositories/%s/%s/pullrequests/%s" % (ws, repo, pr_id), token)
+    if not doc:
+        return None
+
+    raw_state = str(doc.get("state") or "").upper()
+    pr_state = _BITBUCKET_STATE_MAP.get(raw_state, raw_state)
+
+    source = doc.get("source") if isinstance(doc.get("source"), dict) else {}
+    source_commit = source.get("commit") if isinstance(source.get("commit"), dict) else {}
+    sha = str(source_commit.get("hash") or "")
+
+    merge_commit = doc.get("merge_commit") if isinstance(doc.get("merge_commit"), dict) else {}
+    merge_sha = str(merge_commit.get("hash") or "")
+
+    # Commit statuses on the head sha drive the check rollup, Bugbot, and CI
+    # exactly like statusCheckRollup does on GitHub.
+    checks: list = []
+    if sha:
+        statuses_doc = _bitbucket_api_get(
+            root,
+            "repositories/%s/%s/commit/%s/statuses?pagelen=100" % (ws, repo, sha),
+            token,
+        )
+        if isinstance(statuses_doc, dict):
+            values = statuses_doc.get("values") if isinstance(statuses_doc.get("values"), list) else []
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                checks.append(
+                    {
+                        # `name` is what _bugbot_check regexes against, so prefer the human-readable name
+                        # and fall back to the key ("cursor-bugbot"), both of which contain "bugbot".
+                        "name": str(item.get("name") or item.get("key") or ""),
+                        # `state` is what interpret_rollup reads — Bitbucket's values are already
+                        # in the vocabulary interpret_rollup knows (SUCCESSFUL/FAILED/INPROGRESS/STOPPED).
+                        "state": str(item.get("state") or ""),
+                        "startedAt": str(item.get("created_on") or ""),
+                        "completedAt": str(item.get("updated_on") or ""),
+                        "details": str(item.get("description") or ""),
+                        "url": str((item.get("links") or {}).get("self", {}).get("href") or item.get("url") or ""),
+                    }
+                )
+
+    bugbot = _bugbot_from_checks(checks)
+    snap = {
+        "sha": sha,
+        "headSha": sha,
+        "headAt": str(source_commit.get("date") or ""),
+        "rollup": interpret_rollup(checks),
+        "ci": _ci_from_checks(checks),
+        "failedChecks": failed_check_names(checks),
+        "checks": checks,
+        "checkCount": len(checks),
+        # Bitbucket has no analogue of GitHub's mergeable / mergeStateStatus
+        # (BEHIND / DIRTY / CONFLICTING). Leave them empty — downstream code
+        # already treats empty values as "unknown, carry on".
+        "mergeable": "",
+        "mergeStateStatus": "",
+        "behind": False,
+        "conflict": False,
+        "conflictFiles": [],
+        "conflictState": "",
+        "prState": pr_state,
+    }
+    if merge_sha:
+        snap["mergeSha"] = merge_sha
+    if doc.get("created_on"):
+        snap["openedAt"] = str(doc["created_on"])
+    if pr_state == "MERGED" and doc.get("updated_on"):
+        # Bitbucket does not expose a dedicated merged_on; updated_on is the merge time when state=MERGED.
+        snap["mergedAt"] = str(doc["updated_on"])
+    if bugbot:
+        snap["bugbot"] = bugbot
+    snap["bugbotCheck"] = bugbot
+    if bugbot == "pass":
+        snap["findings"] = []
+    # Bitbucket Bugbot finding bodies live in the pull-request comments stream, not in commit statuses.
+    # Parsing those is a separate concern — intentionally not done here, so a Bugbot red just carries
+    # the generic "Bugbot found issues" marker that the GitHub body also uses when gh cannot read comments.
+    elif bugbot == "fail" and sha:
+        snap["findings"] = [
+            "Cursor Bugbot found issues on %s (see its review comments on the pull request)" % sha[:12]
+        ]
+    return snap
+
+
+def _fetch_check_rows_bitbucket(root: Path, pr: str) -> Optional[list]:
+    """Commit-status rows for a Bitbucket pull request's head, or None when
+    the provider cannot be asked. Shape matches the GitHub body: name,
+    conclusion, status, log — so callers stay provider-agnostic.
+    """
+    snap = _fetch_pr_state_bitbucket(root, pr)
+    if not snap:
+        return None
+    rows: list = []
+    for item in snap.get("checks") or []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "name": str(item.get("name") or ""),
+                "conclusion": item.get("state") or "",
+                "status": item.get("status") or "",
+                "log": item.get("details") or item.get("output") or "",
+            }
+        )
+    return rows
+
+
 def fetch_pr_state(root: Path, pr: str) -> Optional[dict]:
-    """Live GitHub pull request state, or None when gh cannot be asked.
+    """Live GitHub or Bitbucket pull request state, or None when the provider
+    cannot be asked.
 
     The snapshot carries the head sha, check rollup, CI, Bugbot, mergeable,
     mergeStateStatus, and conflicting files when the view includes them.
+    GitHub: via gh. Bitbucket: via the Bitbucket Cloud REST API (auth from
+    $BITBUCKET_TOKEN or the x-token-auth token in the git origin URL).
     """
-    if not pr or not shutil.which("gh"):
+    if not pr:
         return None
     text = str(pr)
+    if "bitbucket.org" in text:
+        return _fetch_pr_state_bitbucket(root, text)
+    if not shutil.which("gh"):
+        return None
     if "github.com" not in text and not text.isdigit():
         return None
     viewed = _run(
@@ -1073,9 +1303,12 @@ def lookup_pr(root: Path, branch: str) -> Optional[dict]:
 
 
 def fetch_rollup(root: Path, pr: str, provider: Optional[str]) -> str:
-    """Ask the configured provider. Unknown or unreachable stays pending."""
-    if provider == "bitbucket":
-        return "pending"
+    """Ask the configured provider. Unknown or unreachable stays pending.
+
+    GitHub reads from gh; Bitbucket reads from the Bitbucket Cloud REST API via
+    _fetch_pr_state_bitbucket. The provider arg is kept for API compatibility
+    and may still be useful for future routing.
+    """
     state = fetch_pr_state(root, pr)
     if not state:
         return "pending"
